@@ -1,0 +1,128 @@
+name: Build Android APK
+
+# 只做一件事：在 GitHub 的免费 runner 上编出可安装的 arm64 APK。
+# 不依赖上游 release.yml 里的 4 个签名 secret，也不会发布 Release。
+# 用法：Actions 页 → 左侧 "Build Android APK" → Run workflow → 等 ~30 分钟 → 下载 artifact。
+
+on:
+  workflow_dispatch:
+    inputs:
+      abi:
+        description: "目标 ABI（红米 K40 = aarch64）"
+        type: choice
+        default: aarch64
+        options:
+          - aarch64
+          - armv7
+          - x86_64
+
+permissions:
+  contents: read
+
+env:
+  CI: "true"
+
+jobs:
+  apk:
+    name: Android APK (${{ inputs.abi }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: 准备 Android SDK / NDK
+        run: |
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - uses: swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: src-tauri -> target
+          key: android-apk
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: 生成 Android 工程
+        run: pnpm tauri android init --ci
+
+      - name: 编译 APK
+        env:
+          CARGO_PROFILE_RELEASE_LTO: thin
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "4"
+        run: pnpm tauri android build --apk --split-per-abi --target ${{ inputs.abi }}
+
+      - name: 签名并收集 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          BT="$(ls "$SDK/build-tools" | sort -V | tail -1)"
+          APKSIGNER="$SDK/build-tools/$BT/apksigner"
+          AAPT2="$SDK/build-tools/$BT/aapt2"
+          echo "build-tools: $BT"
+
+          # 一次性签名密钥（不进仓库、不用 secret）。
+          # 代价：每次构建签名不同，覆盖安装前要先卸载旧版。
+          KS="$RUNNER_TEMP/ci.keystore"
+          keytool -genkeypair -keystore "$KS" -storetype PKCS12 -alias ci \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android \
+            -dname "CN=HGhubX Personal Build, O=personal, C=CN" > /dev/null 2>&1
+
+          mkdir -p artifacts
+          n=0
+          while IFS= read -r f; do
+            abi="$(basename "$(dirname "$(dirname "$f")")")"
+            out="artifacts/HGhubX_${VERSION}_${abi}.apk"
+            if "$APKSIGNER" verify "$f" > /dev/null 2>&1; then
+              echo "已是有效签名，直接复制：$f"
+              cp "$f" "$out"
+            else
+              echo "未签名，用临时密钥签名：$f"
+              "$APKSIGNER" sign --ks "$KS" --ks-key-alias ci \
+                --ks-pass pass:android --key-pass pass:android \
+                --v4-signing-enabled false --out "$out" "$f"
+            fi
+            "$APKSIGNER" verify --print-certs "$out" | head -2
+            "$AAPT2" dump badging "$out" | grep -m1 '^package:' || true
+            n=$((n+1))
+          done < <(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk')
+
+          rm -f "$KS"
+          if [ "$n" -eq 0 ]; then
+            echo "::error::没有找到任何 APK"
+            exit 1
+          fi
+          ls -lh artifacts
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: HGhubX-${{ inputs.abi }}-apk
+          path: artifacts/*.apk
+          if-no-files-found: error
+          retention-days: 30
